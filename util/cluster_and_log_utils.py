@@ -4,6 +4,27 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment as linear_assignment
 
 
+def compute_nmi_ari(y_true, y_pred):
+    """Label-free clustering quality (permutation-invariant, no Hungarian).
+
+    Returns (nmi, ari) floats, or (None, None) if sklearn is unavailable.
+    Ported from BaCon (generality track) for SOTA-comparable reporting.
+    """
+    try:
+        from sklearn.metrics import (adjusted_rand_score,
+                                     normalized_mutual_info_score)
+    except Exception:
+        return None, None
+    try:
+        y_true = np.asarray(y_true, dtype=int)
+        y_pred = np.asarray(y_pred, dtype=int)
+        return (float(normalized_mutual_info_score(
+                    y_true, y_pred, average_method='arithmetic')),
+                float(adjusted_rand_score(y_true, y_pred)))
+    except Exception:
+        return None, None
+
+
 def all_sum_item(item):
     item = torch.tensor(item).cuda()
     dist.all_reduce(item)
@@ -161,6 +182,9 @@ def log_accs_from_preds(y_true, y_pred, mask, eval_funcs, save_name, T=None,
     y_true = y_true.astype(int)
     y_pred = y_pred.astype(int)
 
+    # Clustering structure (no Hungarian needed) — logged once per call.
+    nmi, ari = compute_nmi_ari(y_true, y_pred)
+
     for i, f_name in enumerate(eval_funcs):
 
         acc_f = EVAL_FUNCS[f_name]
@@ -168,17 +192,25 @@ def log_accs_from_preds(y_true, y_pred, mask, eval_funcs, save_name, T=None,
         log_name = f'{save_name}_{f_name}'
 
         if i == 0:
-            to_return = (all_acc, old_acc, new_acc)
+            to_return = (all_acc, old_acc, new_acc, nmi, ari)
 
         if print_output:
             print_str = f'Epoch {T}, {log_name}: All {all_acc:.4f} | Old {old_acc:.4f} | New {new_acc:.4f}'
+            nmi_str = f'{nmi:.4f}' if nmi is not None else 'n/a'
+            ari_str = f'{ari:.4f}' if ari is not None else 'n/a'
+            # NOTE (generality track): original code swallowed ALL detail lines on
+            # single-GPU runs because dist.get_rank() raises without init_process_group.
+            # Fixed: single-process always logs; multi-GPU keeps rank-0 gating.
             try:
-                if dist.get_rank() == 0:
-                    try:
-                        args.logger.info(print_str)
-                    except:
-                        print(print_str)
-            except:
-                pass
+                should_log = (dist.get_rank() == 0)
+            except Exception:
+                should_log = True
+            if should_log:
+                try:
+                    args.logger.info(print_str)
+                    args.logger.info(f'Clustering structure: NMI {nmi_str} | ARI {ari_str}')
+                except Exception:
+                    print(print_str)
+                    print(f'Clustering structure: NMI {nmi_str} | ARI {ari_str}')
 
     return to_return

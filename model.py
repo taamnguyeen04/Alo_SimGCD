@@ -199,10 +199,12 @@ class DistillLoss(nn.Module):
         super().__init__()
         self.student_temp = student_temp
         self.ncrops = ncrops
+        warmup_teacher_temp_epochs = min(int(warmup_teacher_temp_epochs),
+                                             int(nepochs))
         self.teacher_temp_schedule = np.concatenate((
             np.linspace(warmup_teacher_temp,
                         teacher_temp, warmup_teacher_temp_epochs),
-            np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
+            np.ones(max(int(nepochs) - warmup_teacher_temp_epochs, 0)) * teacher_temp
         ))
 
     def forward(self, student_output, teacher_output, epoch):

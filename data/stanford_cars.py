@@ -16,30 +16,70 @@ class CarsDataset(Dataset):
     """
     def __init__(self, train=True, limit=0, data_dir=car_root, transform=None):
 
-        metas = os.path.join(data_dir, 'devkit/cars_train_annos.mat') if train else os.path.join(data_dir, 'devkit/cars_test_annos_withlabels.mat')
-        data_dir = os.path.join(data_dir, 'cars_train/') if train else os.path.join(data_dir, 'cars_test/')
+        # NOTE (generality track, scars): the Modal volume carries a repackaged
+        # layout — car_data/car_data/{train,test}/<class>/*.jpg plus
+        # anno_{train,test}.csv (filename,x1,y1,x2,y2,1-based-class) — instead of
+        # the official devkit/*.mat + cars_train//cars_test/ tree. Verified 1:1
+        # against the official release (8144 train / 8041 test rows, labels
+        # 1..196 fully covered; bboxes are unused by SimGCD, which reads only
+        # filename + class from .mat). Official layout, when present, is used
+        # unchanged; otherwise this branch reproduces identical (path,
+        # 1-based-label) pairs so the SSB protocol is unaffected.
+        repack_img_root = os.path.join(data_dir, 'car_data', 'car_data',
+                                       'train' if train else 'test')
+        repack_anno = os.path.join(data_dir, f'anno_{"train" if train else "test"}.csv')
+        use_repack = (not os.path.exists(os.path.join(data_dir, 'devkit'))) \
+            and os.path.isdir(repack_img_root) and os.path.isfile(repack_anno)
 
         self.loader = default_loader
-        self.data_dir = data_dir
-        self.data = []
-        self.target = []
         self.train = train
-
         self.transform = transform
 
-        if not isinstance(metas, str):
-            raise Exception("Train metas must be string location !")
-        labels_meta = mat_io.loadmat(metas)
+        if use_repack:
+            import csv as _csv
+            index = {}
+            for _root, _dirs, _files in os.walk(repack_img_root):
+                for _f in _files:
+                    if _f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        index.setdefault(_f, os.path.join(_root, _f))
+            self.data, self.target = [], []
+            with open(repack_anno, newline='') as _fh:
+                for _i, _row in enumerate(_csv.reader(_fh)):
+                    if limit and _i > limit:
+                        break
+                    _path = index.get(_row[0])
+                    if _path is None:
+                        raise FileNotFoundError(
+                            f'[scars-repack] {_row[0]} listed in {repack_anno} '
+                            f'but not found under {repack_img_root}')
+                    self.data.append(_path)
+                    self.target.append(int(_row[5]))  # 1-based, .mat convention
+            _expected = 8144 if train else 8041
+            assert len(self.data) == _expected, \
+                f'[scars-repack] got {len(self.data)} rows, official split has {_expected}'
+            assert set(self.target) == set(range(1, 197)), \
+                '[scars-repack] label coverage is not the full official 1..196'
+        else:
+            metas = os.path.join(data_dir, 'devkit/cars_train_annos.mat') if train else os.path.join(data_dir, 'devkit/cars_test_annos_withlabels.mat')
+            data_dir = os.path.join(data_dir, 'cars_train/') if train else os.path.join(data_dir, 'cars_test/')
 
-        for idx, img_ in enumerate(labels_meta['annotations'][0]):
-            if limit:
-                if idx > limit:
-                    break
+            self.data_dir = data_dir
+            self.data = []
+            self.target = []
 
-            # self.data.append(img_resized)
-            self.data.append(data_dir + img_[5][0])
-            # if self.mode == 'train':
-            self.target.append(img_[4][0][0])
+            if not isinstance(metas, str):
+                raise Exception("Train metas must be string location !")
+            labels_meta = mat_io.loadmat(metas)
+
+            for idx, img_ in enumerate(labels_meta['annotations'][0]):
+                if limit:
+                    if idx > limit:
+                        break
+
+                # self.data.append(img_resized)
+                self.data.append(data_dir + img_[5][0])
+                # if self.mode == 'train':
+                self.target.append(img_[4][0][0])
 
         self.uq_idxs = np.array(range(len(self)))
         self.target_transform = None
