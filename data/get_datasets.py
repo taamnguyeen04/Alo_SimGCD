@@ -8,6 +8,7 @@ from data.cub import get_cub_datasets
 from data.fgvc_aircraft import get_aircraft_datasets
 
 from copy import deepcopy
+import inspect
 import pickle
 import os
 
@@ -41,10 +42,17 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
 
     # Get datasets
     get_dataset_f = get_dataset_funcs[dataset_name]
-    datasets = get_dataset_f(train_transform=train_transform, test_transform=test_transform,
-                            train_classes=args.train_classes,
-                            prop_train_labels=args.prop_train_labels,
-                            split_train_val=False)
+    dataset_kwargs = dict(
+        train_transform=train_transform,
+        test_transform=test_transform,
+        train_classes=args.train_classes,
+        prop_train_labels=args.prop_train_labels,
+        split_train_val=False,
+    )
+    if 'imb_ratio' in inspect.signature(get_dataset_f).parameters:
+        dataset_kwargs['imb_ratio'] = getattr(args, 'imb_ratio', None)
+
+    datasets = get_dataset_f(**dataset_kwargs)
     # Set target transforms:
     target_transform_dict = {}
     for i, cls in enumerate(list(args.train_classes) + list(args.unlabeled_classes)):
@@ -154,7 +162,16 @@ def get_class_splits(args):
 
         args.image_size = 224
 
-        if use_ssb_splits:
+        if getattr(args, 'imb_ratio', None) is not None:
+            # Imb split carries its OWN known/novel assignment (random perm,
+            # only ~45/100 overlap with SSB). Eval identity must follow the
+            # split, otherwise Old/New are measured on the wrong classes.
+            # Takes precedence over --use_ssb_splits when both are given.
+            from data.cub import get_cub_imb_class_splits
+            args.train_classes, args.unlabeled_classes = \
+                get_cub_imb_class_splits(args.imb_ratio)
+
+        elif use_ssb_splits:
 
             split_path = os.path.join(osr_split_dir, 'cub_osr_splits.pkl')
             with open(split_path, 'rb') as handle:

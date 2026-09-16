@@ -149,11 +149,13 @@ MODEL_TAG = "simgcd"
 
 
 def _variant_tag(enable_pseudo_labeling=False, pseudo_mode=1, enable_novel_pseudo=False,
-                 use_parts=False, num_slots=3, use_teacher=False):
+                 use_parts=False, num_slots=3, use_teacher=False, imb_ratio=None):
     """Short readable variant: base / m1 / m1-novel / ... + +partsS3 when on.
 
     Slots use S (S2/S3) so they never collide with mode labels (M1/M2/M3).
     +teacher appended last when the momentum teacher graft is on.
+    -imbN appended last when a precomputed BaCon split is used
+    (1 = balanced, 10 = long-tailed); absent = legacy SSB/uniform path.
     """
     if not enable_pseudo_labeling:
         v = "base"
@@ -165,6 +167,8 @@ def _variant_tag(enable_pseudo_labeling=False, pseudo_mode=1, enable_novel_pseud
         v = f"{v}+partsS{int(num_slots)}"
     if use_teacher:
         v = f"{v}+teacher"
+    if imb_ratio is not None and int(imb_ratio) > 0:
+        v = f"{v}-imb{int(imb_ratio)}"
     return v
 
 
@@ -264,6 +268,8 @@ def _preflight_check(**kwargs) -> None:
     if kwargs.get("use_momentum_teacher", False):
         command += ["--use_momentum_teacher",
                     "--teacher_m0", str(kwargs.get("teacher_m0", 0.996))]
+    if kwargs.get("imb_ratio", None) is not None:
+        command += ["--imb_ratio", str(int(kwargs.get("imb_ratio")))]
     _validate_flags(command)
     print("[preflight] flags OK.", flush=True)
 
@@ -337,6 +343,10 @@ def train(
     # repeat seed (passed as --seed; also stamped into exp name as seed{N},
     # same convention as the HypCD/DebGCD launchers).
     seed: int = -1,
+    # Imbalance: None = legacy SSB/uniform path (default, keeps all old runs
+    # identical); 1 = balanced precomputed split (cub200_k100_imb1);
+    # 10 = long-tailed split (cub200_k100_imb10). CUB-only for now.
+    imb_ratio: int | None = None,
     # Pseudo labeling (porter BaCon; launcher params use _ which Modal CLI
     # shows as -; train.py flags use _ and are built by _pseudo_train_flags)
     enable_pseudo_labeling: bool = False,
@@ -380,7 +390,7 @@ def train(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = _BACKBONE_TAGS.get(backbone, backbone)
     variant = _variant_tag(enable_pseudo_labeling, pseudo_mode, enable_novel_pseudo,
-                           use_parts, num_slots, use_momentum_teacher)
+                           use_parts, num_slots, use_momentum_teacher, imb_ratio)
     seed_tag = f"-seed{int(seed)}" if seed is not None and int(seed) >= 0 else ""
     exp_name = f"{MODEL_TAG}-{dataset_name}-{variant}-{tag}{seed_tag}-{stamp}"
     if exp_name_suffix:
@@ -436,6 +446,8 @@ def train(
                     "--teacher_m0", str(teacher_m0)]
     if seed is not None and int(seed) >= 0:
         command += ["--seed", str(int(seed))]
+    if imb_ratio is not None:
+        command += ["--imb_ratio", str(int(imb_ratio))]
     if extra_args:
         command += extra_args
 
@@ -468,6 +480,9 @@ def main(
     extra_args: str = "",
     exp_name_suffix: str = "",
     seed: int = -1,
+    # Imbalance: None = legacy SSB/uniform path; 1 = balanced precomputed
+    # split; 10 = long-tailed split (CUB-only for now).
+    imb_ratio: int | None = None,
     enable_pseudo_labeling: bool = False,
     pseudo_mode: int = 1,
     confidence_threshold: float = 0.9,
@@ -518,6 +533,7 @@ def main(
         novel_jaccard_th=novel_jaccard_th, novel_agree_th=novel_agree_th,
         novel_min_size=novel_min_size, seed=seed,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        imb_ratio=imb_ratio,
     )
     result = train.remote(
         dataset_name=dataset_name, backbone=backbone, epochs=epochs,
@@ -538,7 +554,7 @@ def main(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
-        seed=seed,
+        seed=seed, imb_ratio=imb_ratio,
     )
     print(f"\nDone: {result['experiment_name']}\nDir: {result['experiment_dir']}")
 
@@ -557,6 +573,9 @@ def launch(
     extra_args: str = "",
     exp_name_suffix: str = "",
     seed: int = -1,
+    # Imbalance: None = legacy SSB/uniform path; 1 = balanced precomputed
+    # split; 10 = long-tailed split (CUB-only for now).
+    imb_ratio: int | None = None,
     enable_pseudo_labeling: bool = False,
     pseudo_mode: int = 1,
     confidence_threshold: float = 0.9,
@@ -617,7 +636,7 @@ def launch(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
-        seed=seed,
+        seed=seed, imb_ratio=imb_ratio,
     )
     call = train.spawn(
         dataset_name=dataset_name, backbone=backbone, epochs=epochs,
@@ -638,7 +657,7 @@ def launch(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
-        seed=seed,
+        seed=seed, imb_ratio=imb_ratio,
     )
     print("\n" + "=" * 60)
     print(f"Spawned detached Modal run (call id: {call.object_id})")

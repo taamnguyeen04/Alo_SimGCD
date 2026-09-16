@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
+import torch
 from copy import deepcopy
 
 from torchvision.datasets.folder import default_loader
@@ -143,8 +144,80 @@ def get_train_val_indices(train_dataset, val_split=0.2):
     return train_idxs, val_idxs
 
 
+def get_cub_imb_class_splits(imb_ratio):
+    """Known/novel classes read straight from the precomputed BaCon split.
+
+    Eval identity MUST match supervision: SSB classes do NOT apply when an
+    imb split is used (overlap is only ~45/100). Positional indices in the
+    .pt files address the sorted-image_id train ordering with 0-based
+    targets (label-1) — same convention as make_cub_lt_splits.py and
+    CustomCub2011 below (target-1).
+    """
+    imb_ratio = int(imb_ratio)
+    split_dir = os.path.join('data_uq_idxs_bacon', f'cub200_k100_imb{imb_ratio}')
+    if not os.path.isdir(split_dir):
+        raise FileNotFoundError(f'Precomputed CUB imbalance split not found: {split_dir}')
+    l_k = torch.load(os.path.join(split_dir, 'l_k_uq_idxs.pt'),
+                     map_location='cpu', weights_only=False)
+    unl_k = torch.load(os.path.join(split_dir, 'unl_k_uq_idxs.pt'),
+                       map_location='cpu', weights_only=False)
+    unl_unk = torch.load(os.path.join(split_dir, 'unl_unk_uq_idxs.pt'),
+                         map_location='cpu', weights_only=False)
+
+    txt_dir = os.path.join(cub_root, 'CUB_200_2011')
+    labels, is_train = {}, {}
+    with open(os.path.join(txt_dir, 'image_class_labels.txt')) as f:
+        for line in f:
+            k, v = line.split()
+            labels[int(k)] = int(v) - 1
+    with open(os.path.join(txt_dir, 'train_test_split.txt')) as f:
+        for line in f:
+            k, v = line.split()
+            is_train[int(k)] = int(v)
+    targets = np.array([labels[i] for i in sorted(labels) if is_train.get(i) == 1])
+
+    known = sorted(set(targets[np.asarray(l_k)].tolist())
+                   | set(targets[np.asarray(unl_k)].tolist()))
+    novel = sorted(set(targets[np.asarray(unl_unk)].tolist()))
+    assert len(known) == 100 and len(novel) == 100, \
+        f'imb{imb_ratio}: expected 100/100 classes, got {len(known)}/{len(novel)}'
+    assert not (set(known) & set(novel)), 'imb split known/novel overlap!'
+    return known, novel
+
+
 def get_cub_datasets(train_transform, test_transform, train_classes=range(160), prop_train_labels=0.8,
-                    split_train_val=False, seed=0, download=False):
+                    split_train_val=False, seed=0, download=False, imb_ratio=None):
+
+    if imb_ratio is not None:
+        if not isinstance(imb_ratio, int):
+            imb_ratio = int(imb_ratio)
+
+        split_dir = os.path.join('data_uq_idxs_bacon', f'cub200_k100_imb{imb_ratio}')
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(f'Precomputed CUB imbalance split not found: {split_dir}')
+
+        l_k = np.array(torch.load(os.path.join(split_dir, 'l_k_uq_idxs.pt'),
+                                    map_location='cpu', weights_only=False))
+        unl_k = np.array(torch.load(os.path.join(split_dir, 'unl_k_uq_idxs.pt'),
+                                    map_location='cpu', weights_only=False))
+        unl_unk = np.array(torch.load(os.path.join(split_dir, 'unl_unk_uq_idxs.pt'),
+                                      map_location='cpu', weights_only=False))
+
+        whole_training_set = CustomCub2011(root=cub_root, transform=train_transform, train=True, download=download)
+        train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k)
+        train_dataset_unlabelled = subsample_dataset(
+            deepcopy(whole_training_set),
+            np.concatenate([unl_k, unl_unk]).astype(np.int64)
+        )
+        test_dataset = CustomCub2011(root=cub_root, transform=test_transform, train=False)
+
+        all_datasets = {
+            'train_labelled': train_dataset_labelled,
+            'train_unlabelled': train_dataset_unlabelled,
+            'val': None,
+            'test': test_dataset,
+        }
+        return all_datasets
 
     np.random.seed(seed)
 
