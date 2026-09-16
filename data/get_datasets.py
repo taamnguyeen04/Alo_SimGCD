@@ -41,10 +41,25 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
 
     # Get datasets
     get_dataset_f = get_dataset_funcs[dataset_name]
-    datasets = get_dataset_f(train_transform=train_transform, test_transform=test_transform,
-                            train_classes=args.train_classes,
-                            prop_train_labels=args.prop_train_labels,
-                            split_train_val=False)
+    dataset_kwargs = dict(
+        train_transform=train_transform,
+        test_transform=test_transform,
+        train_classes=args.train_classes,
+        prop_train_labels=args.prop_train_labels,
+        split_train_val=False,
+    )
+    if dataset_name == 'cub' and getattr(args, 'uq_split', None):
+        split_name = args.uq_split
+        split_dir = split_name if os.path.isabs(split_name) else os.path.join(
+            'data_uq_idxs_bacon', split_name)
+        dataset_kwargs['uq_split_dir'] = split_dir
+        if hasattr(args, 'logger'):
+            args.logger.info(f'Using fixed CUB uq split: {split_dir}')
+    datasets = get_dataset_f(**dataset_kwargs)
+    if dataset_name == 'cub' and getattr(args, 'uq_split', None) and hasattr(args, 'logger'):
+        args.logger.info(
+            'Fixed CUB split sizes: labeled-known={} | unlabeled-total={}'.format(
+                len(datasets['train_labelled']), len(datasets['train_unlabelled'])))
     # Set target transforms:
     target_transform_dict = {}
     for i, cls in enumerate(list(args.train_classes) + list(args.unlabeled_classes)):
@@ -74,6 +89,14 @@ def get_class_splits(args):
             use_ssb_splits = args.use_ssb_splits
         else:
             use_ssb_splits = False
+
+    # The repository-owned BaCon split named cub200_k100_* was generated
+    # with classes 0..99 as known and 100..199 as novel. It is therefore not
+    # compatible with CUB's semantic SSB class list, even when the general
+    # --use_ssb_splits default is enabled.
+    uq_split_name = os.path.basename(str(getattr(args, 'uq_split', '') or ''))
+    if args.dataset_name == 'cub' and uq_split_name.startswith('cub200_k100_'):
+        use_ssb_splits = False
 
     # -------------
     # GET CLASS SPLITS

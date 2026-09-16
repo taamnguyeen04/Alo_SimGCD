@@ -63,6 +63,53 @@ Our results:
 
 <table><thead><tr><th>Source</th><th colspan="3">Paper (3 runs) </th><th colspan="3">Current Github (5 runs) </th></tr></thead><tbody><tr><td>Dataset</td><td>All</td><td>Old</td><td>New</td><td>All</td><td>Old</td><td>New</td></tr><tr><td>CIFAR10</td><td>97.1±0.0</td><td>95.1±0.1</td><td>98.1±0.1</td><td>97.0±0.1</td><td>93.9±0.1</td><td>98.5±0.1</td></tr><tr><td>CIFAR100</td><td>80.1±0.9</td><td>81.2±0.4</td><td>77.8±2.0</td><td>79.8±0.6</td><td>81.1±0.5</td><td>77.4±2.5</td></tr><tr><td>ImageNet-100</td><td>83.0±1.2</td><td>93.1±0.2</td><td>77.9±1.9</td><td>83.6±1.4</td><td>92.4±0.1</td><td>79.1±2.2</td></tr><tr><td>ImageNet-1K</td><td>57.1±0.1</td><td>77.3±0.1</td><td>46.9±0.2</td><td>57.0±0.4</td><td>77.1±0.1</td><td>46.9±0.5</td></tr><tr><td>CUB</td><td>60.3±0.1</td><td>65.6±0.9</td><td>57.7±0.4</td><td>61.5±0.5</td><td>65.7±0.5</td><td>59.4±0.8</td></tr><tr><td>Stanford Cars</td><td>53.8±2.2</td><td>71.9±1.7</td><td>45.0±2.4</td><td>53.4±1.6</td><td>71.5±1.6</td><td>44.6±1.7</td></tr><tr><td>FGVC-Aircraft</td><td>54.2±1.9</td><td>59.1±1.2</td><td>51.8±2.3</td><td>54.3±0.7</td><td>59.4±0.4</td><td>51.7±1.2</td></tr><tr><td>Herbarium 19</td><td>44.0±0.4</td><td>58.0±0.4</td><td>36.4±0.8</td><td>44.2±0.2</td><td>57.6±0.6</td><td>37.0±0.4</td></tr></tbody></table>
 
+## Fixed imbalanced CUB split
+
+Use `--uq_split cub200_k100_imb10` with `train.py`, or
+`--uq-split cub200_k100_imb10` with the Modal launcher. This fixed split uses
+867 labelled-known, 870 unlabelled-known, and 586 unlabelled-novel training
+images from `data_uq_idxs_bacon/cub200_k100_imb10/`.
+The `k100` split defines classes 0-99 as known and 100-199 as novel; when this
+split is selected it intentionally overrides the semantic SSB class split.
+
+Full model (known + novel pseudo-labels, parts, and momentum teacher) on Modal:
+
+```bash
+modal run -d modal_train_simgcd.py::launch \
+  --dataset-name cub \
+  --uq-split cub200_k100_imb10 \
+  --backbone dinov2-vitb14 \
+  --seed 0 \
+  --memax-weight 2 \
+  --epochs 200 \
+  --exp-name-suffix CUB_IMB10_FULL \
+  --enable-pseudo-labeling \
+  --pseudo-mode 1 \
+  --confidence-threshold 0.9 \
+  --pseudo-top-ratio 0.8 \
+  --max-samples-per-class 500 \
+  --pseudo-update-freq 10 \
+  --max-pseudo-iterations 20 \
+  --pseudo-warmup-epoch 30 \
+  --pseudo-conf-bar 0.5 \
+  --pseudo-bar-k 2.0 \
+  --pseudo-min-hi 10 \
+  --enable-novel-pseudo \
+  --novel-warmup-epoch 50 \
+  --novel-update-freq 10 \
+  --max-novel-iterations 6 \
+  --novel-max-samples 200 \
+  --novel-jaccard-th 0.6 \
+  --novel-agree-th 0.7 \
+  --novel-min-size 10 \
+  --use-parts \
+  --num-slots 3 \
+  --part-lambda 0.5 \
+  --tau-c 0.1 \
+  --use-momentum-teacher \
+  --teacher-m0 0.996
+```
+
 ## Citing this work
 
 If you find this repo useful for your research, please consider citing our paper:

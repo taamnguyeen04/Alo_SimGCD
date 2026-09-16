@@ -231,6 +231,8 @@ def _preflight_check(**kwargs) -> None:
         "--exp_name", "PREFLIGHT",
         "--exp_root", "/tmp/preflight",
     ]
+    if kwargs.get("uq_split"):
+        command += ["--uq_split", str(kwargs["uq_split"])]
     for c in (kwargs.get("extra_args") or []):
         if isinstance(c, str) and c.startswith("--"):
             command.append(c)
@@ -367,6 +369,8 @@ def train(
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    # Optional fixed BaCon-style sample split, e.g. cub200_k100_imb10.
+    uq_split: str = "",
 ) -> dict:
     """Train SimGCD (mirrors simgcd/scripts/run_cub.sh defaults unless overridden)."""
     backbone = (backbone or "").replace("-", "_")
@@ -382,7 +386,8 @@ def train(
     variant = _variant_tag(enable_pseudo_labeling, pseudo_mode, enable_novel_pseudo,
                            use_parts, num_slots, use_momentum_teacher)
     seed_tag = f"-seed{int(seed)}" if seed is not None and int(seed) >= 0 else ""
-    exp_name = f"{MODEL_TAG}-{dataset_name}-{variant}-{tag}{seed_tag}-{stamp}"
+    split_tag = f"-{Path(uq_split).name}" if uq_split else ""
+    exp_name = f"{MODEL_TAG}-{dataset_name}{split_tag}-{variant}-{tag}{seed_tag}-{stamp}"
     if exp_name_suffix:
         exp_name = f"{exp_name}-{exp_name_suffix}"
     exp_root = Path(SIMGCD_OUT) / exp_name
@@ -413,6 +418,8 @@ def train(
         "--exp_name", exp_name,
         "--exp_root", str(exp_root),
     ]
+    if uq_split:
+        command += ["--uq_split", uq_split]
     command += _pseudo_train_flags(
         enable_pseudo_labeling=enable_pseudo_labeling, pseudo_mode=pseudo_mode,
         confidence_threshold=confidence_threshold, pseudo_top_ratio=pseudo_top_ratio,
@@ -496,6 +503,7 @@ def main(
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    uq_split: str = "",
 ) -> None:
     """Foreground run (streams logs; keep machine on) or add -d to detach."""
     # Local pre-flight: rebuild the exact command the remote would run and
@@ -518,6 +526,7 @@ def main(
         novel_jaccard_th=novel_jaccard_th, novel_agree_th=novel_agree_th,
         novel_min_size=novel_min_size, seed=seed,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        uq_split=uq_split,
     )
     result = train.remote(
         dataset_name=dataset_name, backbone=backbone, epochs=epochs,
@@ -538,6 +547,7 @@ def main(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        uq_split=uq_split,
         seed=seed,
     )
     print(f"\nDone: {result['experiment_name']}\nDir: {result['experiment_dir']}")
@@ -585,6 +595,7 @@ def launch(
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    uq_split: str = "",
 ) -> None:
     """Fire-and-forget launch: spawns the run detached on Modal and exits.
 
@@ -617,6 +628,7 @@ def launch(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        uq_split=uq_split,
         seed=seed,
     )
     call = train.spawn(
@@ -638,6 +650,7 @@ def launch(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        uq_split=uq_split,
         seed=seed,
     )
     print("\n" + "=" * 60)

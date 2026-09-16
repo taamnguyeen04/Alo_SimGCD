@@ -1,7 +1,9 @@
 import os
 import pandas as pd
 import numpy as np
+import torch
 from copy import deepcopy
+from pathlib import Path
 
 from torchvision.datasets.folder import default_loader
 from torchvision.datasets.utils import download_url
@@ -143,28 +145,99 @@ def get_train_val_indices(train_dataset, val_split=0.2):
     return train_idxs, val_idxs
 
 
+def _load_uq_split(split_dir, dataset_size, train_classes, whole_training_set):
+    """Load a fixed BaCon-style CUB split expressed in global ``uq_idx`` values."""
+    split_dir = Path(split_dir)
+    required = {
+        'labeled_known': split_dir / 'l_k_uq_idxs.pt',
+        'unlabeled_known': split_dir / 'unl_k_uq_idxs.pt',
+        'unlabeled_novel': split_dir / 'unl_unk_uq_idxs.pt',
+    }
+    missing = [str(path) for path in required.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            'CUB uq split is incomplete; missing: ' + ', '.join(missing))
+
+    def _load(path):
+        # Torch >=2.6 defaults to weights_only=True, which rejects the numpy
+        # arrays used by these trusted, repository-owned split files. Older
+        # torch releases do not accept the weights_only keyword.
+        try:
+            values = torch.load(path, map_location='cpu', weights_only=False)
+        except TypeError:
+            values = torch.load(path, map_location='cpu')
+        values = np.asarray(values, dtype=np.int64).reshape(-1)
+        if len(values) != len(np.unique(values)):
+            raise ValueError(f'Duplicate uq_idx values in {path}')
+        if len(values) and (values.min() < 0 or values.max() >= dataset_size):
+            raise ValueError(
+                f'Out-of-range uq_idx in {path}; expected [0, {dataset_size - 1}]')
+        return values
+
+    groups = {name: _load(path) for name, path in required.items()}
+    names = list(groups)
+    for i, left in enumerate(names):
+        for right in names[i + 1:]:
+            overlap = np.intersect1d(groups[left], groups[right])
+            if len(overlap):
+                raise ValueError(
+                    f'CUB uq split groups {left} and {right} overlap '
+                    f'on {len(overlap)} samples')
+
+    known = set(int(c) for c in train_classes)
+    raw_targets = whole_training_set.data['target'].to_numpy(dtype=np.int64) - 1
+    bad_labeled = [int(i) for i in groups['labeled_known']
+                   if int(raw_targets[i]) not in known]
+    bad_unlabeled_known = [int(i) for i in groups['unlabeled_known']
+                           if int(raw_targets[i]) not in known]
+    bad_unlabeled_novel = [int(i) for i in groups['unlabeled_novel']
+                           if int(raw_targets[i]) in known]
+    if bad_labeled or bad_unlabeled_known or bad_unlabeled_novel:
+        raise ValueError(
+            'CUB uq split is incompatible with the selected known/novel class split: '
+            f'labeled-known mismatches={len(bad_labeled)}, '
+            f'unlabeled-known mismatches={len(bad_unlabeled_known)}, '
+            f'unlabeled-novel mismatches={len(bad_unlabeled_novel)}')
+    return groups
+
+
 def get_cub_datasets(train_transform, test_transform, train_classes=range(160), prop_train_labels=0.8,
-                    split_train_val=False, seed=0, download=False):
+                    split_train_val=False, seed=0, download=False, uq_split_dir=None):
 
     np.random.seed(seed)
 
     # Init entire training set
     whole_training_set = CustomCub2011(root=cub_root, transform=train_transform, train=True, download=download)
 
-    # Get labelled training set which has subsampled classes, then subsample some indices from that
-    train_dataset_labelled = subsample_classes(deepcopy(whole_training_set), include_classes=train_classes)
-    subsample_indices = subsample_instances(train_dataset_labelled, prop_indices_to_subsample=prop_train_labels)
-    train_dataset_labelled = subsample_dataset(train_dataset_labelled, subsample_indices)
+    if uq_split_dir is not None:
+        groups = _load_uq_split(uq_split_dir, len(whole_training_set),
+                                train_classes, whole_training_set)
+        train_dataset_labelled = subsample_dataset(
+            deepcopy(whole_training_set), groups['labeled_known'])
+        unlabelled_indices = np.concatenate(
+            [groups['unlabeled_known'], groups['unlabeled_novel']])
+        train_dataset_unlabelled = subsample_dataset(
+            deepcopy(whole_training_set), unlabelled_indices)
+    else:
+        # Default SimGCD split: select known classes, then label a fixed
+        # proportion of their instances. Everything else remains unlabelled.
+        train_dataset_labelled = subsample_classes(
+            deepcopy(whole_training_set), include_classes=train_classes)
+        subsample_indices = subsample_instances(
+            train_dataset_labelled,
+            prop_indices_to_subsample=prop_train_labels)
+        train_dataset_labelled = subsample_dataset(
+            train_dataset_labelled, subsample_indices)
+        unlabelled_indices = (set(whole_training_set.uq_idxs) -
+                              set(train_dataset_labelled.uq_idxs))
+        train_dataset_unlabelled = subsample_dataset(
+            deepcopy(whole_training_set), np.array(list(unlabelled_indices)))
 
     # Split into training and validation sets
     train_idxs, val_idxs = get_train_val_indices(train_dataset_labelled)
     train_dataset_labelled_split = subsample_dataset(deepcopy(train_dataset_labelled), train_idxs)
     val_dataset_labelled_split = subsample_dataset(deepcopy(train_dataset_labelled), val_idxs)
     val_dataset_labelled_split.transform = test_transform
-
-    # Get unlabelled data
-    unlabelled_indices = set(whole_training_set.uq_idxs) - set(train_dataset_labelled.uq_idxs)
-    train_dataset_unlabelled = subsample_dataset(deepcopy(whole_training_set), np.array(list(unlabelled_indices)))
 
     # Get test set for all classes
     test_dataset = CustomCub2011(root=cub_root, transform=test_transform, train=False)

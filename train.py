@@ -466,6 +466,9 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_name', type=str, default='scars', help='options: cifar10, cifar100, imagenet_100, cub, scars, fgvc_aricraft, herbarium_19')
     parser.add_argument('--prop_train_labels', type=float, default=0.5)
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
+    parser.add_argument('--uq_split', type=str, default=None,
+                        help='Fixed CUB uq-index split name under data_uq_idxs_bacon/ '
+                             '(for example cub200_k100_imb10), or an absolute path.')
 
     parser.add_argument('--grad_from_block', type=int, default=11)
     parser.add_argument('--seed', type=int, default=-1,
