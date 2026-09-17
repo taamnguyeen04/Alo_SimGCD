@@ -145,7 +145,8 @@ def get_train_val_indices(train_dataset, val_split=0.2):
     return train_idxs, val_idxs
 
 
-def _load_uq_split(split_dir, dataset_size, train_classes, whole_training_set):
+def _load_uq_split(split_dir, dataset_size, train_classes=None,
+                   whole_training_set=None):
     """Load a fixed BaCon-style CUB split expressed in global ``uq_idx`` values."""
     split_dir = Path(split_dir)
     required = {
@@ -184,21 +185,57 @@ def _load_uq_split(split_dir, dataset_size, train_classes, whole_training_set):
                     f'CUB uq split groups {left} and {right} overlap '
                     f'on {len(overlap)} samples')
 
-    known = set(int(c) for c in train_classes)
-    raw_targets = whole_training_set.data['target'].to_numpy(dtype=np.int64) - 1
-    bad_labeled = [int(i) for i in groups['labeled_known']
-                   if int(raw_targets[i]) not in known]
-    bad_unlabeled_known = [int(i) for i in groups['unlabeled_known']
-                           if int(raw_targets[i]) not in known]
-    bad_unlabeled_novel = [int(i) for i in groups['unlabeled_novel']
-                           if int(raw_targets[i]) in known]
-    if bad_labeled or bad_unlabeled_known or bad_unlabeled_novel:
-        raise ValueError(
-            'CUB uq split is incompatible with the selected known/novel class split: '
-            f'labeled-known mismatches={len(bad_labeled)}, '
-            f'unlabeled-known mismatches={len(bad_unlabeled_known)}, '
-            f'unlabeled-novel mismatches={len(bad_unlabeled_novel)}')
+    if train_classes is not None:
+        if whole_training_set is None:
+            raise ValueError('whole_training_set is required to validate class membership')
+        known = set(int(c) for c in train_classes)
+        raw_targets = whole_training_set.data['target'].to_numpy(dtype=np.int64) - 1
+        bad_labeled = [int(i) for i in groups['labeled_known']
+                       if int(raw_targets[i]) not in known]
+        bad_unlabeled_known = [int(i) for i in groups['unlabeled_known']
+                               if int(raw_targets[i]) not in known]
+        bad_unlabeled_novel = [int(i) for i in groups['unlabeled_novel']
+                               if int(raw_targets[i]) in known]
+        if bad_labeled or bad_unlabeled_known or bad_unlabeled_novel:
+            raise ValueError(
+                'CUB uq split is incompatible with the selected known/novel class split: '
+                f'labeled-known mismatches={len(bad_labeled)}, '
+                f'unlabeled-known mismatches={len(bad_unlabeled_known)}, '
+                f'unlabeled-novel mismatches={len(bad_unlabeled_novel)}')
     return groups
+
+
+def get_uq_split_class_partition(split_dir, root=cub_root):
+    """Derive the known/novel class partition encoded by a fixed uq split.
+
+    BaCon-style split names such as ``cub200_k100_imb10`` specify the number
+    of known classes, not their identities. The sample-index files are the
+    source of truth for both the class partition and the long-tailed subset.
+    """
+    images = pd.read_csv(os.path.join(root, 'CUB_200_2011', 'images.txt'),
+                         sep=' ', names=['img_id', 'filepath'])
+    labels = pd.read_csv(
+        os.path.join(root, 'CUB_200_2011', 'image_class_labels.txt'),
+        sep=' ', names=['img_id', 'target'])
+    train_test = pd.read_csv(
+        os.path.join(root, 'CUB_200_2011', 'train_test_split.txt'),
+        sep=' ', names=['img_id', 'is_training_img'])
+    train_data = images.merge(labels, on='img_id').merge(train_test, on='img_id')
+    train_data = train_data[train_data.is_training_img == 1]
+    targets = train_data['target'].to_numpy(dtype=np.int64) - 1
+    groups = _load_uq_split(split_dir, len(targets))
+
+    known_idxs = np.concatenate(
+        [groups['labeled_known'], groups['unlabeled_known']])
+    known = set(int(x) for x in targets[known_idxs])
+    novel = set(int(x) for x in targets[groups['unlabeled_novel']])
+    overlap = known & novel
+    if overlap:
+        raise ValueError(
+            f'CUB uq split assigns {len(overlap)} classes to both known and novel')
+    if known | novel != set(int(x) for x in np.unique(targets)):
+        raise ValueError('CUB uq split class partition does not cover the dataset')
+    return sorted(known), sorted(novel)
 
 
 def get_cub_datasets(train_transform, test_transform, train_classes=range(160), prop_train_labels=0.8,

@@ -69,8 +69,9 @@ Use `--uq_split cub200_k100_imb10` with `train.py`, or
 `--uq-split cub200_k100_imb10` with the Modal launcher. This fixed split uses
 867 labelled-known, 870 unlabelled-known, and 586 unlabelled-novel training
 images from `data_uq_idxs_bacon/cub200_k100_imb10/`.
-The `k100` split defines classes 0-99 as known and 100-199 as novel; when this
-split is selected it intentionally overrides the semantic SSB class split.
+The `k100` suffix means 100 known classes. Their identities and the imbalanced
+sample subset are both derived from the three fixed uq-index files; they are
+not the standard semantic SSB class partition.
 
 Full model (known + novel pseudo-labels, parts, and momentum teacher) on Modal:
 

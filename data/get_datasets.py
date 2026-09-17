@@ -4,7 +4,7 @@ from data.cifar import get_cifar_10_datasets, get_cifar_100_datasets
 from data.herbarium_19 import get_herbarium_datasets
 from data.stanford_cars import get_scars_datasets
 from data.imagenet import get_imagenet_100_datasets, get_imagenet_1k_datasets
-from data.cub import get_cub_datasets
+from data.cub import get_cub_datasets, get_uq_split_class_partition
 from data.fgvc_aircraft import get_aircraft_datasets
 
 from copy import deepcopy
@@ -83,20 +83,24 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
 
 def get_class_splits(args):
 
+    # A fixed CUB uq split defines its own known/novel class identities in
+    # addition to selecting the imbalanced samples. Derive that partition
+    # before the regular SSB/default branches below.
+    if args.dataset_name == 'cub' and getattr(args, 'uq_split', None):
+        split_name = args.uq_split
+        split_dir = split_name if os.path.isabs(split_name) else os.path.join(
+            'data_uq_idxs_bacon', split_name)
+        args.image_size = 224
+        args.train_classes, args.unlabeled_classes = \
+            get_uq_split_class_partition(split_dir)
+        return args
+
     # For FGVC datasets, optionally return bespoke splits
     if args.dataset_name in ('scars', 'cub', 'aircraft'):
         if hasattr(args, 'use_ssb_splits'):
             use_ssb_splits = args.use_ssb_splits
         else:
             use_ssb_splits = False
-
-    # The repository-owned BaCon split named cub200_k100_* was generated
-    # with classes 0..99 as known and 100..199 as novel. It is therefore not
-    # compatible with CUB's semantic SSB class list, even when the general
-    # --use_ssb_splits default is enabled.
-    uq_split_name = os.path.basename(str(getattr(args, 'uq_split', '') or ''))
-    if args.dataset_name == 'cub' and uq_split_name.startswith('cub200_k100_'):
-        use_ssb_splits = False
 
     # -------------
     # GET CLASS SPLITS
