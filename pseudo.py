@@ -533,6 +533,21 @@ def build_uq_to_true_label(unlabelled_dataset):
             if data is not None and hasattr(data, 'target'):
                 import pandas as _pd  # SimGCD CUB-style metadata
                 targets = (data['target'].to_numpy() - 1).tolist()
+        if targets is None and hasattr(ds, 'target'):
+            # CarsDataset: .target is a 1-based list (see stanford_cars.py
+            # __getitem__: target = self.target[idx] - 1, then
+            # target_transform). Mirror that exactly for the audit map.
+            try:
+                import numpy as _np
+                _raw = _np.asarray(ds.target).reshape(-1)
+                if len(_raw) == len(ds):
+                    _lbl = [_int0 - 1 for _int0 in _raw.astype(int).tolist()]
+                    _tform = getattr(ds, 'target_transform', None)
+                    if _tform is not None:
+                        _lbl = [_tform(_l) for _l in _lbl]
+                    targets = _lbl
+            except Exception:
+                targets = None
         uq_idxs = getattr(ds, 'uq_idxs', None)
         if targets is not None and uq_idxs is not None:
             for t, u in zip(targets, uq_idxs):
@@ -547,6 +562,26 @@ def count_labeled_per_class(labeled_dataset, out):
     if targets is not None:
         for t in targets:
             out[int(t)] = out.get(int(t), 0) + 1
+    elif hasattr(labeled_dataset, 'target'):
+        # CarsDataset sibling of the branch above (1-based -> -1, then
+        # target_transform), so the distribution log isn't empty on Cars.
+        try:
+            import numpy as _np
+            _raw = _np.asarray(labeled_dataset.target).reshape(-1)
+            if len(_raw) == len(labeled_dataset):
+                _tform = getattr(labeled_dataset, 'target_transform', None)
+                for _t in _raw.astype(int).tolist():
+                    _l = int(_t) - 1
+                    if _tform is not None:
+                        _l = int(_tform(_l))
+                    out[_l] = out.get(_l, 0) + 1
+                return
+        except Exception:
+            pass
+        inner = getattr(labeled_dataset, 'datasets', None)
+        if inner is not None:
+            for d in inner:
+                count_labeled_per_class(d, out)
     else:
         inner = getattr(labeled_dataset, 'datasets', None)
         if inner is not None:

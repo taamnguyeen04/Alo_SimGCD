@@ -32,6 +32,16 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
     if args.fp16:
         fp16_scaler = torch.cuda.amp.GradScaler()
 
+    start_epoch = int(getattr(args, 'start_epoch', 0) or 0)
+
+    _resume_opt = getattr(args, '_resume_optimizer', None)
+    if _resume_opt is not None:
+        try:
+            optimizer.load_state_dict(_resume_opt)
+            args.logger.info('[RESUME] optimizer state restored.')
+        except Exception as e:
+            args.logger.warning(f'[RESUME] optimizer load failed (fresh optimizer): {e}')
+
     exp_lr_scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=args.epochs,
@@ -60,6 +70,25 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
         scheduler_gate = lr_scheduler.CosineAnnealingLR(
             optimizer_gate, T_max=args.epochs, eta_min=0.01 * 1e-3)
         args.logger.info('[AdaPart] optimizers: part(lr=0.05) + gate(lr=0.01) ready.')
+
+    # ----------------------
+    # RESUME (preemption-safe): model.pt saved every epoch as
+    # {'model': student.state_dict(), 'optimizer': ..., 'epoch': epoch+1}.
+    # Teacher is rebuilt from the resumed student inside train() so no
+    # teacher state is needed. Schedulers are fast-forwarded to start_epoch
+    # to keep the cosine schedule continuous. Best tracking restarts
+    # (old .best.pt files are kept until beaten again).
+    # Pseudo hasn't started before warmup so fresh pseudo state is correct.
+    # ----------------------
+    if start_epoch > 0:
+        for _ in range(start_epoch):
+            exp_lr_scheduler.step()
+            if scheduler_part is not None:
+                scheduler_part.step()
+            if scheduler_gate is not None:
+                scheduler_gate.step()
+        args.logger.info(f'[RESUME] continuing from epoch {start_epoch} '
+                         f'(schedulers fast-forwarded).')
 
 
     cluster_criterion = DistillLoss(
@@ -117,7 +146,7 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
     # best_train_acc_ubl = 0 
     # best_train_acc_all = 0
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         loss_record = AverageMeter()
         # A1: momentum theo lich cosine (chi dung khi teacher bat)
         if teacher is not None:
@@ -133,12 +162,21 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
 
             with torch.cuda.amp.autocast(fp16_scaler is not None):
                 student_proj, student_out = student(images)
-                if teacher is not None:
+                # Fix B: delayed teacher activation. The EMA teacher starts
+                # from a random head, so its early targets poison the shared
+                # backbone (Cars Test New@25 was 16.6 vs 55.8 no-teacher).
+                # Before --teacher_warmup_epoch, distill like legacy
+                # (student.detach); the teacher still EMA-updates silently
+                # below, so it is warmed up when switched on.
+                _teacher_warm = int(getattr(args, 'teacher_warmup_epoch', 0) or 0)
+                if teacher is not None and epoch >= _teacher_warm:
                     # A1: dap an tu teacher cham (on dinh), khong phai student.detach()
                     with torch.no_grad():
                         _, teacher_out = teacher(images)
+                    distill_student = student_out
                 else:
                     teacher_out = student_out.detach()
+                    distill_student = student_out
 
                 # clustering, sup
                 sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
@@ -146,7 +184,7 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
 
                 # clustering, unsup
-                cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
+                cluster_loss = cluster_criterion(distill_student, teacher_out, epoch)
                 avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
                 me_max_loss = - torch.sum(torch.log(avg_probs**(-avg_probs))) + math.log(float(len(avg_probs)))
                 cluster_loss += args.memax_weight * me_max_loss
@@ -261,6 +299,32 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
             args._best_t_all, args._best_t_old, args._best_t_new = t_acc, t_old, t_new
             args._best_t_nmi, args._best_t_ari = t_nmi, t_ari
             args._best_t_epoch = epoch
+            try:
+                torch.save({'model': student.state_dict(), 'epoch': epoch + 1},
+                           args.model_path + '.best_test.pt')
+                args.logger.info(f'New best DISJOINT-test All {t_acc:.4f} (epoch {epoch})'
+                                 ' -> model.pt.best_test.pt')
+            except Exception as e:
+                args.logger.warning(f'Best-test save failed: {e}')
+
+        # Early stopping on disjoint-test All (opt-in; 0 = off = legacy
+        # run-all-epochs). Counter resets on any improvement; on trigger we
+        # break AFTER the per-epoch save below so model.pt is the stop epoch
+        # while model.pt.best_test.pt keeps the best one. Final Best
+        # summaries after the loop still print.
+        _es_patience = int(getattr(args, 'early_stop_patience', 0) or 0)
+        _es_stop = False
+        if _es_patience > 0:
+            if t_acc > getattr(args, '_es_best', -1):
+                args._es_best = t_acc
+                args._es_bad = 0
+            else:
+                args._es_bad = getattr(args, '_es_bad', 0) + 1
+            if args._es_bad >= _es_patience:
+                args.logger.info(f'Early stopping: no disjoint-test All improvement '
+                                 f'for {_es_patience} epochs (best {args._es_best:.4f}) '
+                                 f'— stopping at epoch {epoch}.')
+                _es_stop = True
 
         # AdaPart gate camera (cheap; answers "which slots does each class use?").
         if part_bank is not None and (epoch % 10 == 0 or epoch == args.epochs - 1):
@@ -398,6 +462,9 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
         torch.save(save_dict, args.model_path)
         args.logger.info("model saved to {}.".format(args.model_path))
 
+        if _es_stop:
+            break
+
     if getattr(args, '_best_all', -1) >= 0:
         args.logger.info('Best (transductive) over {} epochs: All {:.4f} | Old {:.4f} | New {:.4f} '
                          '(epoch {}, NMI {} ARI {})'.format(
@@ -465,8 +532,10 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_model_dir', type=str, default=None)
     parser.add_argument('--dataset_name', type=str, default='scars', help='options: cifar10, cifar100, imagenet_100, cub, scars, fgvc_aricraft, herbarium_19')
     parser.add_argument('--imb_ratio', type=int, default=None,
-                        help='Optional precomputed imbalance ratio to load from data_uq_idxs_bacon, e.g. 10 for CUB-200 k=100 IR=10. '
-                             '1 = balanced precomputed split. None (default) = legacy SSB/uniform path.')
+                        help='Optional precomputed imbalance ratio to load from data_uq_idxs_bacon, '
+                             'e.g. 10 for CUB-200 k=100 IR=10 / cars196 k=98 IR=10. '
+                             '1 = balanced precomputed split (CUB-only for now). '
+                             'None (default) = legacy SSB/uniform path.')
     parser.add_argument('--prop_train_labels', type=float, default=0.5)
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
 
@@ -475,6 +544,12 @@ if __name__ == "__main__":
                         help='Train seed for paper repeats (e.g. 0/1). '
                              '-1 = legacy unseeded behavior (not reproducible). '
                              'Split files stay fixed; only init/sampler/aug vary.')
+    parser.add_argument('--early_stop_patience', type=int, default=0,
+                        help='Early stopping patience: epochs without disjoint-test All '
+                             'improvement before stopping. 0 = off (legacy: run all epochs).')
+    parser.add_argument('--gate_init', type=float, default=-1.0,
+                        help='Constant init for part gate_logits (sigmoid -> open fraction). '
+                             '-1.0 ~= 0.27 closed-start (legacy); 0.0 = 0.50 open-start.')
     parser.add_argument('--backbone', type=str, default='dinov2_vitb14',
                         choices=['dino_vitb16', 'dinov2_vitb14', 'dinov2_vitb14_reg'],
                         help='ViT backbone (default DINOv2-B/14 for the generality track; '
@@ -502,10 +577,24 @@ if __name__ == "__main__":
                              'instead of student.detach().')
     parser.add_argument('--teacher_m0', type=float, default=0.996,
                         help='Initial EMA momentum (cosine schedule -> 1.0).')
+    parser.add_argument('--teacher_fused', action='store_true', default=False,
+                        help='DEPRECATED, do not use: fused teacher freezes random '
+                             'part prototypes (buffers not EMA-tracked). Default '
+                             'global teacher + global-branch distill is correct.')
+    parser.add_argument('--teacher_warmup_epoch', type=int, default=0,
+                        help='Fix B: epochs before this use legacy student.detach() '
+                             'as the distill target while the EMA teacher warms up '
+                             'silently. 0 = teacher from epoch 0 (legacy). '
+                             'Try 30 on Cars to recover early Novel.')
 
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--print_freq', default=10, type=int)
     parser.add_argument('--exp_name', default=None, type=str)
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from a Modal-volume checkpoint (model.pt). '
+                             'Loads student weights (+optimizer if present) and continues '
+                             'the epoch loop + cosine schedule from ckpt epoch. '
+                             'Use the /bacon-storage/.../model.pt path, NOT best.pt.')
 
     # ----------------------
     # ADAPART (ported from BaCon; underscore style like this repo)
@@ -668,7 +757,11 @@ if __name__ == "__main__":
         part_bank = PartPrototypeBank(num_classes=args.num_classes,
                                       num_slots=args.num_slots,
                                       dim=args.feat_dim).to(device)
-        nn.init.constant_(part_bank.gate_logits, -1.0)  # a~=0.27, open gradually
+        nn.init.constant_(part_bank.gate_logits,
+                           float(getattr(args, 'gate_init', -1.0)))
+        args.logger.info(f'[AdaPart] gate init constant '
+                         f'{float(getattr(args, "gate_init", -1.0)):.2f} '
+                         f'(a~=0.27 if -1.0, 0.50 if 0.0)')
         model = PartFusedModel(backbone, projector, part_module, part_bank,
                                part_lambda=args.part_lambda).to(device)
         args.logger.info(f'[AdaPart] Enabled: M={args.num_slots} slots, '
@@ -676,6 +769,33 @@ if __name__ == "__main__":
     else:
         part_module = part_bank = None
         model = nn.Sequential(backbone, projector).to(device)
+
+    # ----------------------
+    # RESUME: load BEFORE train() so the momentum teacher is rebuilt from
+    # resumed weights and prototype EMA continues naturally.
+    # ----------------------
+    args.start_epoch = 0
+    if getattr(args, 'resume', None):
+        import os as _os
+        _ckpt_path = args.resume
+        if not _os.path.isfile(_ckpt_path):
+            raise FileNotFoundError(f'--resume not found: {_ckpt_path}')
+        args.logger.info(f'[RESUME] loading checkpoint: {_ckpt_path}')
+        _ckpt = torch.load(_ckpt_path, map_location='cpu')
+        _state = _ckpt.get('model', _ckpt) if isinstance(_ckpt, dict) else _ckpt
+        _missing, _unexpected = model.load_state_dict(_state, strict=False)
+        args.logger.info(f'[RESUME] load_state_dict strict=False '
+                         f'missing={len(_missing) if isinstance(_missing, list) else _missing} '
+                         f'unexpected={len(_unexpected) if isinstance(_unexpected, list) else _unexpected}')
+        try:
+            args.start_epoch = int(_ckpt.get('epoch', 0) or 0)
+        except Exception:
+            args.start_epoch = 0
+        args.logger.info(f'[RESUME] start_epoch={args.start_epoch} '
+                         f'(optimizer state in ckpt: {"optimizer" in _ckpt if isinstance(_ckpt, dict) else False})')
+        args._resume_optimizer = (_ckpt.get('optimizer') if isinstance(_ckpt, dict) else None)
+    else:
+        args._resume_optimizer = None
 
     # ----------------------
     # TRAIN

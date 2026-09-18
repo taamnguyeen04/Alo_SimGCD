@@ -43,26 +43,46 @@ def _ema_update_teacher(teacher_params, source_params, m):
 
 
 def _build_teacher(student, args, device=None):
-    """Build EMA teacher over the student's global path.
+    """Build EMA teacher over the student's global path (default) or the full
+    fused path when --teacher_fused is set with --use_parts.
 
     Returns (teacher, source_params): teacher is eval/grad-off; source_params
-    are the LIVE student params the teacher tracks (backbone+projector only).
+    are the LIVE student params the teacher tracks.
 
-    Plain Sequential: try deepcopy(student) first (exact copy incl. buffers);
-    on RuntimeError (weight_norm deepcopy breaks on torch>=2.1 — same hazard
-    as BaCon's CE_Head) fall back to deepcopy(backbone) + fresh DINOHead +
-    load_state_dict.
-    Parts (PartFusedModel): rebuild the global path directly — deepcopying the
-    fused model would drag part_bank buffers/gates into the teacher for no
-    benefit (BaCon's teacher never sees part modules either).
+    Default (correct with --use_parts): backbone+projector only, part modules
+    stay student-side like BaCon. train.py distills student GLOBAL logits
+    (PartFusedModel.last_global_logits) against this teacher, so the loss is
+    matched global-vs-global; cls_loss/me_max/test stay on fused logits.
+
+    --teacher_fused (DEPRECATED, do not use): deepcopies the whole fused
+    model. WRONG because PartPrototypeBank.prototypes is a BUFFER, and
+    _ema_update_teacher only tracks parameters — the teacher's prototypes
+    freeze at random init forever, so teacher_out = global_ema + noise.
+    Kept only so old commands don't crash; it logs a warning.
     """
     from model import DINOHead
 
     if device is None:
         device = next(student.parameters()).device
     use_parts = bool(getattr(args, 'use_parts', False)) and hasattr(student, 'projector')
+    fused = bool(getattr(args, 'teacher_fused', False)) and use_parts
 
     teacher = None
+    if fused:
+        # DEPRECATED path: frozen random prototypes (see docstring).
+        try:
+            import logging as _logging
+            _logging.getLogger().warning(
+                '[TEACHER] --teacher_fused is deprecated (frozen part '
+                'prototypes). Running anyway; prefer default global teacher.')
+            teacher = deepcopy(student)
+            source_params = list(student.parameters())
+            for p in teacher.parameters():
+                p.requires_grad = False
+            teacher.eval()
+            return teacher, source_params
+        except RuntimeError:
+            teacher = None  # fall through to global-path rebuild
     if not use_parts:
         try:
             teacher = deepcopy(student)

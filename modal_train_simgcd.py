@@ -268,8 +268,22 @@ def _preflight_check(**kwargs) -> None:
     if kwargs.get("use_momentum_teacher", False):
         command += ["--use_momentum_teacher",
                     "--teacher_m0", str(kwargs.get("teacher_m0", 0.996))]
+        if kwargs.get("teacher_fused", False):
+            command.append("--teacher_fused")
+        if int(kwargs.get("teacher_warmup_epoch", 0) or 0) > 0:
+            command += ["--teacher_warmup_epoch",
+                        str(int(kwargs.get("teacher_warmup_epoch")))]
     if kwargs.get("imb_ratio", None) is not None:
         command += ["--imb_ratio", str(int(kwargs.get("imb_ratio")))]
+    if kwargs.get("early_stop_patience", 0) is not None \
+            and int(kwargs.get("early_stop_patience", 0)) > 0:
+        command += ["--early_stop_patience",
+                    str(int(kwargs.get("early_stop_patience")))]
+    if kwargs.get("fp16", False):
+        command.append("--fp16")
+    command += ["--gate_init", str(float(kwargs.get("gate_init", -1.0)))]
+    if kwargs.get("resume", None):
+        command += ["--resume", str(kwargs.get("resume"))]
     _validate_flags(command)
     print("[preflight] flags OK.", flush=True)
 
@@ -323,7 +337,13 @@ def fetch_aircraft() -> dict:
 
 @app.function(
     image=image,
-    gpu="A100-80GB",  # TEMP: PRO-6000 hết hàng; về lại RTX-PRO-6000 khi có hàng
+    # GPU selectable via env (default A100-80GB for deadline full runs):
+    # $env:SIMGCD_GPU="A10G" (PowerShell) for cheap tests.
+    gpu=os.environ.get("SIMGCD_GPU", "A100-80GB"),
+    # 8 CPUs so the 8 DataLoader workers (+ KMeans novel-door on CPU) don't
+    # starve a fast GPU. CPU is cheap next to GPU hours; drop to 4 if Modal
+    # quotas complain.
+    cpu=8,
     timeout=60 * 60 * 24,
     volumes={STORAGE_DIR: storage_volume},
 )
@@ -377,6 +397,19 @@ def train(
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    teacher_fused: bool = False,
+    teacher_warmup_epoch: int = 0,
+    # Early stopping: 0 = off (legacy run-all-epochs); >0 = epochs without
+    # disjoint-test All improvement before stopping (best kept in best_test.pt).
+    early_stop_patience: int = 0,
+    # Mixed precision: big free speedup (~1.3-1.6x) on A100/H100, halves
+    # activation memory (fits bigger batches). Validate vs fp32 once.
+    fp16: bool = False,
+    # Gate init constant: -1.0 = closed-start (legacy); 0.0 = open-start.
+    gate_init: float = -1.0,
+    # Resume from a volume checkpoint (preemption-safe continuation).
+    # Pass the FULL /bacon-storage path to model.pt (not best.pt).
+    resume: str | None = None,
 ) -> dict:
     """Train SimGCD (mirrors simgcd/scripts/run_cub.sh defaults unless overridden)."""
     backbone = (backbone or "").replace("-", "_")
@@ -444,15 +477,34 @@ def train(
     if use_momentum_teacher:
         command += ["--use_momentum_teacher",
                     "--teacher_m0", str(teacher_m0)]
+        if teacher_fused:
+            command.append("--teacher_fused")
+        if int(teacher_warmup_epoch or 0) > 0:
+            command += ["--teacher_warmup_epoch", str(int(teacher_warmup_epoch))]
     if seed is not None and int(seed) >= 0:
         command += ["--seed", str(int(seed))]
     if imb_ratio is not None:
         command += ["--imb_ratio", str(int(imb_ratio))]
+    if early_stop_patience is not None and int(early_stop_patience) > 0:
+        command += ["--early_stop_patience", str(int(early_stop_patience))]
+    if fp16:
+        command.append("--fp16")
+    command += ["--gate_init", str(float(gate_init))]
+    if resume:
+        command += ["--resume", str(resume)]
     if extra_args:
         command += extra_args
 
-    _run(command)
-    storage_volume.commit()
+    # Preemption-safe: train.py saves model.pt every epoch, so at most 1
+    # epoch is lost. Always commit the volume even when Modal preempts
+    # the container, otherwise checkpoints die with the container.
+    try:
+        _run(command)
+    finally:
+        try:
+            storage_volume.commit()
+        except Exception as e:
+            print(f'[volume] commit failed (non-fatal): {e}', flush=True)
     return {"experiment_name": exp_name, "experiment_dir": str(exp_root)}
 
 
@@ -511,6 +563,15 @@ def main(
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    teacher_fused: bool = False,
+    teacher_warmup_epoch: int = 0,
+    # Early stopping: 0 = off (legacy run-all-epochs); >0 = patience.
+    early_stop_patience: int = 0,
+    # Mixed precision: big free speedup on A100/H100. Validate vs fp32 once.
+    fp16: bool = False,
+    # Gate init constant: -1.0 = closed-start (legacy); 0.0 = open-start.
+    gate_init: float = -1.0,
+    resume: str | None = None,
 ) -> None:
     """Foreground run (streams logs; keep machine on) or add -d to detach."""
     # Local pre-flight: rebuild the exact command the remote would run and
@@ -533,7 +594,9 @@ def main(
         novel_jaccard_th=novel_jaccard_th, novel_agree_th=novel_agree_th,
         novel_min_size=novel_min_size, seed=seed,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
-        imb_ratio=imb_ratio,
+        teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
+        imb_ratio=imb_ratio, early_stop_patience=early_stop_patience, fp16=fp16,
+        gate_init=gate_init, resume=resume,
     )
     result = train.remote(
         dataset_name=dataset_name, backbone=backbone, epochs=epochs,
@@ -554,7 +617,10 @@ def main(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
         seed=seed, imb_ratio=imb_ratio,
+        early_stop_patience=early_stop_patience, fp16=fp16,
+        gate_init=gate_init, resume=resume,
     )
     print(f"\nDone: {result['experiment_name']}\nDir: {result['experiment_dir']}")
 
@@ -604,6 +670,15 @@ def launch(
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
     teacher_m0: float = 0.996,
+    teacher_fused: bool = False,
+    teacher_warmup_epoch: int = 0,
+    # Early stopping: 0 = off (legacy run-all-epochs); >0 = patience.
+    early_stop_patience: int = 0,
+    # Mixed precision: big free speedup on A100/H100. Validate vs fp32 once.
+    fp16: bool = False,
+    # Gate init constant: -1.0 = closed-start (legacy); 0.0 = open-start.
+    gate_init: float = -1.0,
+    resume: str | None = None,
 ) -> None:
     """Fire-and-forget launch: spawns the run detached on Modal and exits.
 
@@ -636,7 +711,10 @@ def launch(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
         seed=seed, imb_ratio=imb_ratio,
+        early_stop_patience=early_stop_patience, fp16=fp16,
+        gate_init=gate_init, resume=resume,
     )
     call = train.spawn(
         dataset_name=dataset_name, backbone=backbone, epochs=epochs,
@@ -657,7 +735,10 @@ def launch(
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
         part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
+        teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
         seed=seed, imb_ratio=imb_ratio,
+        early_stop_patience=early_stop_patience, fp16=fp16,
+        gate_init=gate_init, resume=resume,
     )
     print("\n" + "=" * 60)
     print(f"Spawned detached Modal run (call id: {call.object_id})")
