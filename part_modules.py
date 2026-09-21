@@ -107,7 +107,10 @@ class PartFusedModel(nn.Module):
 
     forward(images) -> (proj, fused_logits) where
       fused = global_logits + part_lambda * g_part.
-    Also stashes detached r_norm (self.last_r_norm) for prototype EMA in train().
+    Also stashes detached r_norm (self.last_r_norm) for prototype EMA in train()
+    and the global branch (self.last_global_logits) for the AUXILIARY
+    formulation: native SimGCD losses (CE/distill/me_max) run on global,
+    parts only add an auxiliary fused CE (see train.py).
     Submodules (part queries/gates/prototypes) ride inside student.state_dict()
     automatically, so checkpoints need no format change (load old ones with
     strict=False).
@@ -121,6 +124,12 @@ class PartFusedModel(nn.Module):
         self.part_bank = part_bank
         self.part_lambda = part_lambda
         self.last_r_norm = None
+        # WITH-grad stash, read by train() in the SAME iteration only:
+        # native losses run on this global branch under AUX formulation.
+        self.last_global_logits = None
+        # Detached CLS stash for the kmeans-feat eval head (Option B):
+        # norm([z_cls || gate-weighted r_pool]) — no second forward in test().
+        self.last_cls = None
 
     def forward(self, images):
         from backbone_adapter import forward_backbone_tokens
@@ -130,4 +139,6 @@ class PartFusedModel(nn.Module):
         g_part, _, _ = self.part_bank(r_norm)
         fused = global_logits + self.part_lambda * g_part
         self.last_r_norm = r_norm.detach()
+        self.last_global_logits = global_logits
+        self.last_cls = cls.detach()
         return proj, fused

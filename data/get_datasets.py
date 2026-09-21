@@ -125,7 +125,14 @@ def get_class_splits(args):
 
         args.image_size = 224
 
-        if use_ssb_splits:
+        if getattr(args, 'imb_ratio', None) is not None:
+            # Same rule as CUB: eval identity follows the split, never SSB.
+            # Takes precedence over --use_ssb_splits when both are given.
+            from data.stanford_cars import get_scars_imb_class_splits
+            args.train_classes, args.unlabeled_classes = \
+                get_scars_imb_class_splits(args.imb_ratio)
+
+        elif use_ssb_splits:
 
             split_path = os.path.join(osr_split_dir, 'scars_osr_splits.pkl')
             with open(split_path, 'rb') as handle:

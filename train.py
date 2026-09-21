@@ -26,7 +26,20 @@ from pseudo import (CEView, audit_pseudo_samples, build_uq_to_true_label,
 
 
 def train(student, train_loader, test_loader, unlabelled_train_loader, args):
+    # Option B: the main optimizer must NOT touch part_module/part_bank
+    # params (BaCon keeps them in optimizer_part/optimizer_gate only).
+    # Under AUX the native loss graph has no path to them, so the only
+    # effect of leaving them in is double-stepping (main lr=0.1 + part
+    # lr=0.05 + gate lr=0.01) when the aux fused CE fires — filter them out.
+    _part_param_ids = set()
+    if getattr(args, 'use_parts', False):
+        for _pn, _pp in student.named_parameters():
+            if _pn.startswith('part_module.') or _pn.startswith('part_bank.'):
+                _part_param_ids.add(id(_pp))
     params_groups = get_params_groups(student)
+    if _part_param_ids:
+        for g in params_groups:
+            g['params'] = [p for p in g['params'] if id(p) not in _part_param_ids]
     optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     fp16_scaler = None
     if args.fp16:
@@ -162,30 +175,30 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
 
             with torch.cuda.amp.autocast(fp16_scaler is not None):
                 student_proj, student_out = student(images)
-                # Fix B: delayed teacher activation. The EMA teacher starts
-                # from a random head, so its early targets poison the shared
-                # backbone (Cars Test New@25 was 16.6 vs 55.8 no-teacher).
-                # Before --teacher_warmup_epoch, distill like legacy
-                # (student.detach); the teacher still EMA-updates silently
-                # below, so it is warmed up when switched on.
+                # AUXILIARY formulation (friend review): native SimGCD losses
+                # run on the GLOBAL branch; parts only add an auxiliary fused
+                # CE. Without parts, global IS fused (identical behavior).
+                _use_aux = bool(getattr(student, 'last_global_logits', None) is not None)
+                native_out = student.last_global_logits if _use_aux else student_out
+                # Fix B: delayed teacher activation (random head early poisons
+                # the shared backbone). Before warmup, legacy self-distill;
+                # the teacher still EMA-updates silently below.
                 _teacher_warm = int(getattr(args, 'teacher_warmup_epoch', 0) or 0)
                 if teacher is not None and epoch >= _teacher_warm:
                     # A1: dap an tu teacher cham (on dinh), khong phai student.detach()
                     with torch.no_grad():
                         _, teacher_out = teacher(images)
-                    distill_student = student_out
                 else:
-                    teacher_out = student_out.detach()
-                    distill_student = student_out
+                    teacher_out = native_out.detach()
 
-                # clustering, sup
-                sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
+                # clustering, sup (native, global)
+                sup_logits = torch.cat([f[mask_lab] for f in (native_out / 0.1).chunk(2)], dim=0)
                 sup_labels = torch.cat([class_labels[mask_lab] for _ in range(2)], dim=0)
                 cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
 
-                # clustering, unsup
-                cluster_loss = cluster_criterion(distill_student, teacher_out, epoch)
-                avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
+                # clustering, unsup (native, global-vs-global: matched)
+                cluster_loss = cluster_criterion(native_out, teacher_out, epoch)
+                avg_probs = (native_out / 0.1).softmax(dim=1).mean(dim=0)
                 me_max_loss = - torch.sum(torch.log(avg_probs**(-avg_probs))) + math.log(float(len(avg_probs)))
                 cluster_loss += args.memax_weight * me_max_loss
 
@@ -208,6 +221,16 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 loss = 0
                 loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
                 loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
+
+                # Auxiliary fused supervision (ProtoTail): parts learn from
+                # labeled fused logits WITHOUT hijacking the native losses.
+                # _use_aux is False without parts -> zero change vs legacy.
+                if _use_aux:
+                    _aux_weight = float(getattr(args, 'aux_weight', 0.5))
+                    aux_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
+                    aux_loss = nn.CrossEntropyLoss()(aux_logits, sup_labels)
+                    loss = loss + _aux_weight * aux_loss
+                    pstr += f'aux_fused: {aux_loss.item():.4f} '
 
                 # AdaPart gate regularization (BaCon weight 0.05; no
                 # distribution-adaptive term: SimGCD has no dist_est).
@@ -250,7 +273,13 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
             # NOTE: view-0 = first B rows (images = cat(view0, view1), labels are
             # B-sized per item). BaCon takes [:B//n_views] here (quarter batch —
             # latent bug, kept frozen there to not disturb running numbers).
-            if part_bank is not None and epoch >= min(30, args.epochs - 1):
+            # Fix C (Option B): bound the self-referential novel-EMA window to
+            # [ema_start, 60] like BaCon (bacon.py:464) — unbounded to ep200 let
+            # prototypes chase their own argmax and drift (CUB proto-only
+            # collapse: loss rises ep31, old 0.73->0.37 ep39-44). Known-class
+            # update_ema stays unbounded, same as BaCon.
+            _ema_start = min(30, args.epochs - 1)
+            if part_bank is not None and epoch >= _ema_start and epoch <= 60:
                 with torch.no_grad():
                     B_view = class_labels.size(0)
                     r_v0 = student.last_r_norm[:B_view].detach()
@@ -259,7 +288,9 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                     if mask_v0.sum() > 0:
                         part_bank.update_ema(r_v0[mask_v0], lab_v0[mask_v0])
                     if (not mask_v0.all()) and not getattr(args, 'ablate_confidence', False):
-                        f0 = student_out.chunk(2)[0].detach()
+                        # Option B: novel pseudo source = GLOBAL logits (native
+                        # branch), not fused self-argmax — breaks the drift loop.
+                        f0 = native_out.chunk(2)[0].detach()
                         novel_mask = ~mask_v0
                         pseudo_pred = f0[novel_mask].argmax(dim=-1)
                         w = torch.softmax(f0[novel_mask] / args.tau_c, dim=-1).max(dim=-1)[0]
@@ -465,6 +496,20 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
         if _es_stop:
             break
 
+        # Wall-clock budget (e.g. --max_hours 4): stop cleanly AFTER the
+        # per-epoch save above so model.pt + best files stay valid and the
+        # run can be resumed with --resume. 0 = off.
+        _max_h = float(getattr(args, 'max_hours', 0) or 0)
+        if _max_h > 0:
+            import time as _time
+            _t0 = getattr(args, '_train_t0', None)
+            if _t0 is None:
+                args._train_t0 = _time.time()
+            elif _time.time() - _t0 > _max_h * 3600:
+                args.logger.info(f'Time budget reached ({_max_h:.2f}h) '
+                                 f'— stopping at epoch {epoch} (resumable).')
+                break
+
     if getattr(args, '_best_all', -1) >= 0:
         args.logger.info('Best (transductive) over {} epochs: All {:.4f} | Old {:.4f} | New {:.4f} '
                          '(epoch {}, NMI {} ARI {})'.format(
@@ -505,6 +550,11 @@ def test(model, test_loader, epoch, save_name, args):
 
     preds, targets = [], []
     mask = np.array([])
+    # Option B heads (parts runs only): collect GLOBAL logits and BaCon-style
+    # features in the same pass. kmeans-feat is the PRIMARY metric (comparable
+    # to the BaCon track); fused/global argmax are diagnostics.
+    glob_preds, feats = [], []
+    _use_parts = hasattr(model, 'part_bank') and model.part_bank is not None
     for batch_idx, (images, label, _) in enumerate(tqdm(test_loader)):
         images = images.cuda(non_blocking=True)
         with torch.no_grad():
@@ -512,12 +562,47 @@ def test(model, test_loader, epoch, save_name, args):
             preds.append(logits.argmax(1).cpu().numpy())
             targets.append(label.cpu().numpy())
             mask = np.append(mask, np.array([True if x.item() in range(len(args.train_classes)) else False for x in label]))
+            if _use_parts:
+                glob_preds.append(model.last_global_logits.argmax(1).cpu().numpy())
+                # z_eval = norm([z_cls || gate-weighted r_pool]); class-agnostic
+                # mean gate like reeval_aux.py (per-class r_pool is circular).
+                r_norm = model.last_r_norm
+                a = torch.sigmoid(model.part_bank.gate_logits).mean(dim=0)
+                r_pool = (r_norm * a.view(1, -1, 1)).sum(dim=1)
+                import torch.nn.functional as _F
+                feats.append(_F.normalize(
+                    torch.cat([_F.normalize(model.last_cls, dim=-1),
+                               _F.normalize(r_pool, dim=-1)], dim=-1), dim=-1).cpu())
 
     preds = np.concatenate(preds)
     targets = np.concatenate(targets)
     all_acc, old_acc, new_acc, nmi, ari = log_accs_from_preds(
         y_true=targets, y_pred=preds, mask=mask,
         T=epoch, eval_funcs=args.eval_funcs, save_name=save_name, args=args)
+
+    if _use_parts:
+        # Diagnostics: native global-argmax + kmeans-feat (primary).
+        try:
+            from sklearn.cluster import KMeans
+            glob_preds = np.concatenate(glob_preds)
+            g_acc, g_old, g_new, g_nmi, g_ari = log_accs_from_preds(
+                y_true=targets, y_pred=glob_preds, mask=mask,
+                T=epoch, eval_funcs=args.eval_funcs, save_name=f'{save_name} global-argmax', args=args)
+            feats_np = torch.cat(feats).numpy()
+            km = KMeans(n_clusters=args.num_classes, random_state=0, n_init=10)
+            km.fit(feats_np)
+            k_acc, k_old, k_new, k_nmi, k_ari = log_accs_from_preds(
+                y_true=targets, y_pred=km.labels_, mask=mask,
+                T=epoch, eval_funcs=args.eval_funcs, save_name=f'{save_name} kmeans-feat', args=args)
+            args.logger.info(
+                f'[{save_name}] eval heads: fused {all_acc:.4f}/{old_acc:.4f}/{new_acc:.4f} | '
+                f'global {g_acc:.4f}/{g_old:.4f}/{g_new:.4f} | '
+                f'KMEANS-FEAT {k_acc:.4f}/{k_old:.4f}/{k_new:.4f} (primary)')
+            # Primary metric return: kmeans-feat drives best-tracking and
+            # early-stop (comparable to BaCon track).
+            return k_acc, k_old, k_new, k_nmi, k_ari
+        except Exception as e:
+            args.logger.warning(f'kmeans-feat eval failed ({e}); falling back to fused-argmax.')
 
     return all_acc, old_acc, new_acc, nmi, ari
 
@@ -547,6 +632,10 @@ if __name__ == "__main__":
     parser.add_argument('--early_stop_patience', type=int, default=0,
                         help='Early stopping patience: epochs without disjoint-test All '
                              'improvement before stopping. 0 = off (legacy: run all epochs).')
+    parser.add_argument('--max_hours', type=float, default=0,
+                        help='Wall-clock budget in hours: stop cleanly after the '
+                             'per-epoch save once exceeded (resumable via --resume). '
+                             '0 = off.')
     parser.add_argument('--gate_init', type=float, default=-1.0,
                         help='Constant init for part gate_logits (sigmoid -> open fraction). '
                              '-1.0 ~= 0.27 closed-start (legacy); 0.0 = 0.50 open-start.')
@@ -607,6 +696,10 @@ if __name__ == "__main__":
                         help='Weight of part logits in fused score.')
     parser.add_argument('--tau_c', type=float, default=0.1,
                         help='Temperature for novel-EMA confidence.')
+    parser.add_argument('--aux_weight', type=float, default=0.5,
+                        help='AUX formulation: weight of the auxiliary fused CE '
+                             '(labeled only). Native losses stay on global. '
+                             '0 = parts learn via prototype EMA only.')
     parser.add_argument('--ablate_confidence', action='store_true', default=False,
                         help='Disable confidence filtering for novel prototype updates.')
 

@@ -611,10 +611,14 @@ def audit_pseudo_samples(pseudo_samples, uq2true, num_labeled):
     known_leak_sources = Counter()
     novel_confused_true = Counter()
     n_d1 = n_d2 = 0
+    n_miss = 0  # Fix B: uq_idx absent from uq2true (empty audit map) —
+    # never let that masquerade as "nothing to audit" again (pre-92dec06 Cars
+    # bug printed n=0 next to "Collected 633 NOVEL pseudo samples").
     c_ok, c_wo, c_sw, c_nok, c_lk, c_cf = [], [], [], [], [], []
     for s in pseudo_samples:
         true_lbl = uq2true.get(int(s['uq_idx']))
         if true_lbl is None:
+            n_miss += 1
             continue
         pseudo_lbl = int(s['label'])
         try:
@@ -657,6 +661,7 @@ def audit_pseudo_samples(pseudo_samples, uq2true, num_labeled):
                     c_lk.append(conf)
     return {
         'n_selected_gt': len(pseudo_samples),
+        'n_unmapped': n_miss,  # Fix B: audit coverage, not selection quality
         'n_selected_d1': n_d1, 'n_selected_d2': n_d2,
         'n_true_correct': n_true_correct, 'n_wrong_old': n_wrong_old,
         'n_novel_contamination': n_novel,
@@ -678,6 +683,15 @@ def log_pseudo_audit(audit, pseudo_iteration, target_class, args):
         return
     d1 = audit.get('n_selected_d1', sel)
     d2 = audit.get('n_selected_d2', 0)
+    # Fix B: loud failure when the audit map is blind. Pre-92dec06 Cars runs
+    # printed "n=0 — nothing to audit" next to thousands of injected samples
+    # because uq2true was empty; surfaces that state instead of hiding it.
+    n_unmapped = int(audit.get('n_unmapped', 0) or 0)
+    if sel > 0 and n_unmapped > 0.5 * sel:
+        args.logger.warning(f"[PSEUDO AUDIT iter {pseudo_iteration}] audit map covers only "
+                            f"{sel - n_unmapped}/{sel} samples ({n_unmapped} unmapped) — "
+                            "uq2true is empty/partial; check build_uq_to_true_label "
+                            "for this dataset. D1/D2 tables below are NOT ground truth.")
     args.logger.info("\n" + "-" * 60)
     args.logger.info(f"[PSEUDO AUDIT iter {pseudo_iteration}] Ground-truth check of selected pseudo labels"
                      + (f" (target class {target_class})" if target_class is not None else ""))

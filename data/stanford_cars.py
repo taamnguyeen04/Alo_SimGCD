@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
+import torch
 from copy import deepcopy
 from scipy import io as mat_io
 
@@ -147,10 +148,112 @@ def get_train_val_indices(train_dataset, val_split=0.2):
     return train_idxs, val_idxs
 
 
+def _reorder_cars_canonical(dataset):
+    """Reorder into BaCon canonical order (sorted basename) and reset uq_idxs.
+
+    The precomputed .pt splits are POSITIONAL into BaCon's sorted-filename
+    ordering; SimGCD's native order (.mat file order / anno-csv row order) is
+    NOT verified to match (unlike CUB, checked 1:1). Canonicalizing here
+    makes the imb branch layout-independent (official devkit AND repack).
+    """
+    names = [os.path.basename(p) for p in dataset.data]
+    if len(set(names)) != len(names):
+        raise ValueError('duplicate basenames in cars train set — canonical order ambiguous')
+    order = sorted(range(len(names)), key=lambda i: names[i])
+    dataset.data = [dataset.data[i] for i in order]
+    dataset.target = [dataset.target[i] for i in order]
+    dataset.uq_idxs = np.arange(len(order))
+    return dataset
+
+
+def _load_cars_imb_arrays(split_dir, dataset_size):
+    """Load + fail-fast validate the 3 .pt split files (dup/range/overlap)."""
+    def _load(name):
+        path = os.path.join(split_dir, name)
+        try:
+            arr = np.asarray(torch.load(path, map_location='cpu',
+                                        weights_only=False),
+                             dtype=np.int64).reshape(-1)
+        except TypeError:  # very old torch without weights_only
+            arr = np.asarray(torch.load(path, map_location='cpu'),
+                             dtype=np.int64).reshape(-1)
+        if len(arr) != len(np.unique(arr)):
+            raise ValueError(f'Duplicate indices in {path}')
+        if len(arr) and (arr.min() < 0 or arr.max() >= dataset_size):
+            raise ValueError(f'Out-of-range indices in {path} '
+                             f'(expected [0, {dataset_size - 1}])')
+        return arr
+    groups = {n: _load(f) for n, f in
+              [('l_k', 'l_k_uq_idxs.pt'), ('unl_k', 'unl_k_uq_idxs.pt'),
+               ('unl_unk', 'unl_unk_uq_idxs.pt')]}
+    pooled = np.concatenate([groups['l_k'], groups['unl_k'], groups['unl_unk']])
+    if len(pooled) != len(np.unique(pooled)):
+        raise ValueError(f'cars uq split groups overlap ({split_dir})')
+    return groups
+
+
+def get_scars_imb_class_splits(imb_ratio, k=98, n_classes=196):
+    """Known/novel classes straight from the precomputed BaCon cars split.
+
+    Eval identity MUST match supervision: SSB classes do NOT apply when an
+    imb split is used. Derivation uses the same canonical ordering as the
+    imb data branch below, so the two can never disagree.
+    """
+    imb_ratio = int(imb_ratio)
+    split_dir = os.path.join('data_uq_idxs_bacon', f'cars196_k{k}_imb{imb_ratio}')
+    if not os.path.isdir(split_dir):
+        raise FileNotFoundError(f'Precomputed cars imbalance split not found: {split_dir}')
+    whole = CarsDataset(data_dir=car_root, transform=None, train=True)
+    if len(whole) != 8144:
+        raise ValueError(f'cars train N={len(whole)} != 8144: wrong data source?')
+    whole = _reorder_cars_canonical(whole)
+    groups = _load_cars_imb_arrays(split_dir, len(whole))
+    canon_targets = [(int(t) - 1) for t in whole.target]  # 1-based -> 0-based
+    known = sorted(set(canon_targets[i] for i in groups['l_k'])
+                   | set(canon_targets[i] for i in groups['unl_k']))
+    novel = sorted(set(canon_targets[i] for i in groups['unl_unk']))
+    # Fail-fast: a wrong-order split scatters labels, giving ~196 'known'
+    # classes instead of exactly k (plus novel complement) — crash in minutes,
+    # never train garbage for hours.
+    if len(known) != k or len(novel) != n_classes - k \
+            or (set(known) & set(novel)) or len(set(known) | set(novel)) != n_classes:
+        raise ValueError(f'cars imb{imb_ratio}: bad known/novel '
+                         f'({len(known)}/{len(novel)} classes) — split/order mismatch?')
+    return known, novel
+
+
 def get_scars_datasets(train_transform, test_transform, train_classes=range(160), prop_train_labels=0.8,
-                    split_train_val=False, seed=0):
+                    split_train_val=False, seed=0, imb_ratio=None):
 
     np.random.seed(seed)
+
+    if imb_ratio is not None:
+        imb_ratio = int(imb_ratio)
+        split_dir = os.path.join('data_uq_idxs_bacon', f'cars196_k98_imb{imb_ratio}')
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(f'Precomputed cars imbalance split not found: {split_dir}')
+
+        whole_training_set = CarsDataset(data_dir=car_root, transform=train_transform, train=True)
+        if len(whole_training_set) != 8144:
+            raise ValueError(f'cars train N={len(whole_training_set)} != 8144: wrong data source?')
+        whole_training_set = _reorder_cars_canonical(whole_training_set)
+        groups = _load_cars_imb_arrays(split_dir, len(whole_training_set))
+        l_k, unl_k, unl_unk = groups['l_k'], groups['unl_k'], groups['unl_unk']
+
+        train_dataset_labelled = subsample_dataset(deepcopy(whole_training_set), l_k)
+        train_dataset_unlabelled = subsample_dataset(
+            deepcopy(whole_training_set),
+            np.concatenate([unl_k, unl_unk]).astype(np.int64)
+        )
+        test_dataset = CarsDataset(data_dir=car_root, transform=test_transform, train=False)
+
+        all_datasets = {
+            'train_labelled': train_dataset_labelled,
+            'train_unlabelled': train_dataset_unlabelled,
+            'val': None,
+            'test': test_dataset,
+        }
+        return all_datasets
 
     # Init entire training set
     whole_training_set = CarsDataset(data_dir=car_root, transform=train_transform, train=True)

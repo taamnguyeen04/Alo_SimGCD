@@ -262,7 +262,8 @@ def _preflight_check(**kwargs) -> None:
         command += ["--use_parts",
                     "--num_slots", str(kwargs.get("num_slots", 3)),
                     "--part_lambda", str(kwargs.get("part_lambda", 0.5)),
-                    "--tau_c", str(kwargs.get("tau_c", 0.1))]
+                    "--tau_c", str(kwargs.get("tau_c", 0.1)),
+                    "--aux_weight", str(kwargs.get("aux_weight", 0.5))]
         if kwargs.get("ablate_confidence", False):
             command.append("--ablate_confidence")
     if kwargs.get("use_momentum_teacher", False):
@@ -279,6 +280,8 @@ def _preflight_check(**kwargs) -> None:
             and int(kwargs.get("early_stop_patience", 0)) > 0:
         command += ["--early_stop_patience",
                     str(int(kwargs.get("early_stop_patience")))]
+    if float(kwargs.get("max_hours", 0) or 0) > 0:
+        command += ["--max_hours", str(float(kwargs.get("max_hours")))]
     if kwargs.get("fp16", False):
         command.append("--fp16")
     command += ["--gate_init", str(float(kwargs.get("gate_init", -1.0)))]
@@ -393,6 +396,7 @@ def train(
     num_slots: int = 3,
     part_lambda: float = 0.5,
     tau_c: float = 0.1,
+    aux_weight: float = 0.5,
     ablate_confidence: bool = False,
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
@@ -402,6 +406,7 @@ def train(
     # Early stopping: 0 = off (legacy run-all-epochs); >0 = epochs without
     # disjoint-test All improvement before stopping (best kept in best_test.pt).
     early_stop_patience: int = 0,
+    max_hours: float = 0,
     # Mixed precision: big free speedup (~1.3-1.6x) on A100/H100, halves
     # activation memory (fits bigger batches). Validate vs fp32 once.
     fp16: bool = False,
@@ -471,7 +476,8 @@ def train(
         command += ["--use_parts",
                     "--num_slots", str(num_slots),
                     "--part_lambda", str(part_lambda),
-                    "--tau_c", str(tau_c)]
+                    "--tau_c", str(tau_c),
+                    "--aux_weight", str(aux_weight)]
         if ablate_confidence:
             command.append("--ablate_confidence")
     if use_momentum_teacher:
@@ -487,6 +493,8 @@ def train(
         command += ["--imb_ratio", str(int(imb_ratio))]
     if early_stop_patience is not None and int(early_stop_patience) > 0:
         command += ["--early_stop_patience", str(int(early_stop_patience))]
+    if float(max_hours or 0) > 0:
+        command += ["--max_hours", str(float(max_hours))]
     if fp16:
         command.append("--fp16")
     command += ["--gate_init", str(float(gate_init))]
@@ -559,6 +567,7 @@ def main(
     num_slots: int = 3,
     part_lambda: float = 0.5,
     tau_c: float = 0.1,
+    aux_weight: float = 0.5,
     ablate_confidence: bool = False,
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
@@ -567,6 +576,7 @@ def main(
     teacher_warmup_epoch: int = 0,
     # Early stopping: 0 = off (legacy run-all-epochs); >0 = patience.
     early_stop_patience: int = 0,
+    max_hours: float = 0,
     # Mixed precision: big free speedup on A100/H100. Validate vs fp32 once.
     fp16: bool = False,
     # Gate init constant: -1.0 = closed-start (legacy); 0.0 = open-start.
@@ -595,7 +605,7 @@ def main(
         novel_min_size=novel_min_size, seed=seed,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
         teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
-        imb_ratio=imb_ratio, early_stop_patience=early_stop_patience, fp16=fp16,
+        imb_ratio=imb_ratio, early_stop_patience=early_stop_patience, fp16=fp16, max_hours=max_hours,
         gate_init=gate_init, resume=resume,
     )
     result = train.remote(
@@ -615,12 +625,12 @@ def main(
         max_novel_iterations=max_novel_iterations, novel_max_samples=novel_max_samples,
         novel_jaccard_th=novel_jaccard_th, novel_agree_th=novel_agree_th,
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
-        part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
+        part_lambda=part_lambda, tau_c=tau_c, aux_weight=aux_weight, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
         teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
         seed=seed, imb_ratio=imb_ratio,
         early_stop_patience=early_stop_patience, fp16=fp16,
-        gate_init=gate_init, resume=resume,
+        max_hours=max_hours, gate_init=gate_init, resume=resume,
     )
     print(f"\nDone: {result['experiment_name']}\nDir: {result['experiment_dir']}")
 
@@ -666,6 +676,7 @@ def launch(
     num_slots: int = 3,
     part_lambda: float = 0.5,
     tau_c: float = 0.1,
+    aux_weight: float = 0.5,
     ablate_confidence: bool = False,
     # Momentum teacher (porter BaCon A1)
     use_momentum_teacher: bool = False,
@@ -674,6 +685,7 @@ def launch(
     teacher_warmup_epoch: int = 0,
     # Early stopping: 0 = off (legacy run-all-epochs); >0 = patience.
     early_stop_patience: int = 0,
+    max_hours: float = 0,
     # Mixed precision: big free speedup on A100/H100. Validate vs fp32 once.
     fp16: bool = False,
     # Gate init constant: -1.0 = closed-start (legacy); 0.0 = open-start.
@@ -709,12 +721,12 @@ def launch(
         max_novel_iterations=max_novel_iterations, novel_max_samples=novel_max_samples,
         novel_jaccard_th=novel_jaccard_th, novel_agree_th=novel_agree_th,
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
-        part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
+        part_lambda=part_lambda, tau_c=tau_c, aux_weight=aux_weight, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
         teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
         seed=seed, imb_ratio=imb_ratio,
         early_stop_patience=early_stop_patience, fp16=fp16,
-        gate_init=gate_init, resume=resume,
+        max_hours=max_hours, gate_init=gate_init, resume=resume,
     )
     call = train.spawn(
         dataset_name=dataset_name, backbone=backbone, epochs=epochs,
@@ -733,12 +745,12 @@ def launch(
         max_novel_iterations=max_novel_iterations, novel_max_samples=novel_max_samples,
         novel_jaccard_th=novel_jaccard_th, novel_agree_th=novel_agree_th,
         novel_min_size=novel_min_size, use_parts=use_parts, num_slots=num_slots,
-        part_lambda=part_lambda, tau_c=tau_c, ablate_confidence=ablate_confidence,
+        part_lambda=part_lambda, tau_c=tau_c, aux_weight=aux_weight, ablate_confidence=ablate_confidence,
         use_momentum_teacher=use_momentum_teacher, teacher_m0=teacher_m0,
         teacher_fused=teacher_fused, teacher_warmup_epoch=teacher_warmup_epoch,
         seed=seed, imb_ratio=imb_ratio,
         early_stop_patience=early_stop_patience, fp16=fp16,
-        gate_init=gate_init, resume=resume,
+        max_hours=max_hours, gate_init=gate_init, resume=resume,
     )
     print("\n" + "=" * 60)
     print(f"Spawned detached Modal run (call id: {call.object_id})")
