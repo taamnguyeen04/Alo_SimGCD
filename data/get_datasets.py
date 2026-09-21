@@ -6,6 +6,7 @@ from data.stanford_cars import get_scars_datasets
 from data.imagenet import get_imagenet_100_datasets, get_imagenet_1k_datasets
 from data.cub import get_cub_datasets
 from data.fgvc_aircraft import get_aircraft_datasets
+from data.rp2k import get_rp2k_datasets
 
 from copy import deepcopy
 import inspect
@@ -23,7 +24,11 @@ get_dataset_funcs = {
     'herbarium_19': get_herbarium_datasets,
     'cub': get_cub_datasets,
     'aircraft': get_aircraft_datasets,
-    'scars': get_scars_datasets
+    'scars': get_scars_datasets,
+    # RP2k: mất cân bằng TỰ NHIÊN, không dùng file .pt. get_rp2k_datasets có
+    # tham số imb_ratio=None chỉ để tương thích dispatch (truyền None),
+    # nếu truyền số sẽ raise lỗi rõ ràng.
+    'rp2k': get_rp2k_datasets
 }
 
 
@@ -192,6 +197,31 @@ def get_class_splits(args):
 
             args.train_classes = range(100)
             args.unlabeled_classes = range(100, 200)
+
+    elif args.dataset_name == 'rp2k':
+
+        # RP2k: không có SSB splits, không có .pt imbalance.
+        # Mặc định nửa-nửa trên canonical order (sorted instance_id).
+        # N=2233 hiện tại -> 1116 known / 1117 novel. Đọc N động từ meta
+        # để không hardcode khi dataset cập nhật; fallback 2233 nếu chưa có data.
+        args.image_size = 224
+
+        if getattr(args, 'imb_ratio', None) is not None:
+            raise ValueError(
+                'RP2k đã mất cân bằng tự nhiên, không dùng --imb_ratio. '
+                'Hãy chạy với imb_ratio=None.')
+
+        try:
+            from data.rp2k import get_rp2k_default_splits
+            args.train_classes, args.unlabeled_classes = get_rp2k_default_splits()
+        except (ImportError, FileNotFoundError, ValueError) as e:
+            # Chỉ fallback trên lỗi đọc meta (không có data / thiếu cột / import).
+            # Nuốt mọi Exception ở đây sẽ che bug thật và im lặng gán sai
+            # known/novel khi N thực tế != 2233 — kiểu lỗi âm thầm ảnh hưởng số.
+            print(f'[rp2k] WARN: không đọc được split động ({type(e).__name__}: {e}); '
+                  f'fallback cứng 1116/2233. Kiểm tra rp2k_root/meta.csv!')
+            args.train_classes = range(1116)
+            args.unlabeled_classes = range(1116, 2233)
 
     else:
 

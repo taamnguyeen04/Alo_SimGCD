@@ -17,6 +17,10 @@ car_root = _os.environ.get('SIMGCD_SCARS_ROOT', '${DATASET_DIR}/cars')
 aircraft_root = _os.environ.get('SIMGCD_AIRCRAFT_ROOT', '${DATASET_DIR}/fgvc-aircraft-2013b')
 herbarium_dataroot = '${DATASET_DIR}/herbarium_19'
 imagenet_root = '${DATASET_DIR}/ImageNet'
+# NOTE (rp2k): Retail Product 2000, mất cân bằng tự nhiên, tên lớp tiếng Trung
+# (meta.csv UTF-8). Local Windows default: D:/data/RP2k (thư mục chứa meta.csv
+# + rp2k_dataset/all/{train,test}/...). Override bằng SIMGCD_RP2K_ROOT.
+rp2k_root = _os.environ.get('SIMGCD_RP2K_ROOT', 'D:/data/RP2k')
 
 # OSR Split dir
 osr_split_dir = 'data/ssb_splits'
